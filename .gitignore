@@ -1,0 +1,12 @@
+.DS_Store
+.bank/
+.bank-oasis/
+__pycache__/
+*.pyc
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+*.apk
+*.idsig

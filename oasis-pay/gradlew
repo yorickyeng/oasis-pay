@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+java_cmd=java
+if [ -n "${JAVA_HOME:-}" ]; then
+    java_cmd="$JAVA_HOME/bin/java"
+fi
+exec "$java_cmd" -Dorg.gradle.appname=gradlew -jar "$project_dir/gradle/wrapper/gradle-wrapper.jar" "$@"

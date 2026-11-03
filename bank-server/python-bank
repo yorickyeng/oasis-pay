@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+pgadmin_python='/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3'
+if [ -n "${OASIS_PAY_PYTHON:-}" ]; then
+    exec "$OASIS_PAY_PYTHON" "$@"
+fi
+if python3 -c 'import ssl; assert ssl.HAS_TLSv1_3' 2>/dev/null; then
+    exec python3 "$@"
+fi
+for candidate in "$pgadmin_python" /Applications/pgAdmin\ 4.app/Contents/Frameworks/Python.framework/Versions/3.*/bin/python3.1[0-9]; do
+    if [ -x "$candidate" ] && "$candidate" -c 'import ssl; assert ssl.HAS_TLSv1_3' 2>/dev/null; then
+        exec "$candidate" "$@"
+    fi
+done
+echo 'Нужен Python 3.9+ с TLS 1.3. Можно указать его путь через OASIS_PAY_PYTHON.' >&2
+exit 1
