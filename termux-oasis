@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+umask 077
+cd "$(dirname "$0")"
+
+state_dir="$HOME/.local/share/oasis-pay"
+pg_dir="$state_dir/postgres"
+socket_dir="$state_dir/socket"
+keys_dir="$state_dir/keys"
+python="$state_dir/venv/bin/python"
+export PGHOST="$socket_dir" PGPORT=55432 PGUSER=oasis
+export OASIS_DATABASE_URL="dbname=oasis user=oasis port=55432 host='$socket_dir'"
+export PSYCOPG_IMPL=python
+
+bank() { "$python" bank-server/bank.py --state "$keys_dir" "$@"; }
+admin() { "$python" bank-server/admin.py --state "$keys_dir" "$@"; }
+
+start_postgres() {
+    mkdir -p "$socket_dir"
+    if [ ! -f "$pg_dir/PG_VERSION" ]; then
+        initdb -D "$pg_dir" -U oasis --encoding=UTF8 --locale=C --auth-local=trust --auth-host=scram-sha-256 >/dev/null
+    fi
+    if ! pg_ctl -D "$pg_dir" status >/dev/null 2>&1; then
+        pg_ctl -D "$pg_dir" -l "$state_dir/postgres.log" \
+            -o "-c listen_addresses='' -k '$socket_dir' -p $PGPORT" -w start
+    fi
+    if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'oasis'" | grep -qx 1; then
+        createdb oasis
+    fi
+}
+
+case "${1:-help}" in
+    setup)
+        pkg install python python-pip python-cryptography postgresql
+        mkdir -p "$state_dir"
+        python -m venv --system-site-packages "$state_dir/venv"
+        python_abi="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        CBOR2_BUILD_C_EXTENSION=0 LD_PRELOAD='' LDFLAGS="-lpython$python_abi ${LDFLAGS:-}" \
+            "$python" -m pip install 'cffi==2.1.1' 'cbor2==5.9.0' 'psycopg==3.2.13'
+        "$python" -c 'import cbor2, cryptography, psycopg; print("PostgreSQL client:", psycopg.pq.version())'
+        ;;
+    start)
+        [ "$#" -le 2 ] || exit 2
+        [ -x "$python" ] || { echo 'Сначала выполните: sh termux-oasis setup' >&2; exit 1; }
+        if bank health >/dev/null 2>&1; then echo 'Банк уже запущен.' >&2; exit 1; fi
+        start_postgres
+        if [ ! -d "$keys_dir" ]; then
+            bank init --host "${2:-127.0.0.1}" >/dev/null
+        elif [ "$#" -eq 2 ]; then
+            if admin network-ready --host "$2"; then :; else
+                code="$?"
+                [ "$code" -eq 3 ] || exit "$code"
+                admin tls-issue --host "$2"
+                admin tls-apply
+            fi
+        fi
+        bank show
+        printf '\nНа телефоне, где запущен Termux: https://127.0.0.1:8443\n\n'
+        exec "$python" bank-server/bank.py --state "$keys_dir" serve
+        ;;
+    show|health|ledger)
+        bank "$1"
+        ;;
+    stop-db)
+        pg_ctl -D "$pg_dir" -m fast -w stop
+        ;;
+    *)
+        printf '%s\n' 'sh termux-oasis setup | start [IPv4 Android] | show | health | ledger | stop-db'
+        ;;
+esac
