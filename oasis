@@ -1,0 +1,271 @@
+#!/bin/sh
+set -eu
+umask 077
+cd "$(dirname "$0")"
+
+oasis_env="${OASIS_ENV_FILE:-.env}"
+oasis_port="${OASIS_BANK_PORT:-8443}"
+oasis_restart_on_exit=0
+oasis_lock_dir=''
+
+dc() { docker compose --env-file "$oasis_env" "$@"; }
+admin() { dc run --rm --no-deps -T --entrypoint python bank /app/admin.py "$@"; }
+cleanup() {
+    if [ "$oasis_restart_on_exit" -eq 1 ]; then
+        dc up -d --wait bank || echo 'Банк не запущен; проверьте ./oasis status и логи.' >&2
+    fi
+    if [ -n "$oasis_lock_dir" ]; then
+        rm -f "$oasis_lock_dir/pid"
+        rmdir "$oasis_lock_dir"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+lock_maintenance() {
+    oasis_lock_candidate="$PWD/.oasis-lock-${COMPOSE_PROJECT_NAME:-default}"
+    if ! mkdir "$oasis_lock_candidate" 2>/dev/null; then
+        echo "Обслуживание уже выполняется. Блокировка: $oasis_lock_candidate" >&2
+        echo 'Если предыдущий процесс аварийно завершился, проверьте PID в файле pid перед удалением блокировки.' >&2
+        exit 1
+    fi
+    oasis_lock_dir="$oasis_lock_candidate"
+    printf '%s\n' "$$" > "$oasis_lock_dir/pid"
+}
+
+prepare_env() {
+    if [ ! -e "$oasis_env" ]; then
+        oasis_generated_password="$(openssl rand -hex 24)"
+        (set -C; printf 'OASIS_DB_PASSWORD=%s\n' "$oasis_generated_password" > "$oasis_env")
+    fi
+}
+
+prepare_wheels() {
+    case "$(uname -m)" in
+        arm64|aarch64) oasis_arch=arm64; oasis_platform=aarch64 ;;
+        x86_64) oasis_arch=amd64; oasis_platform=x86_64 ;;
+        *) echo 'Поддерживаются ARM64 и x86-64.' >&2; exit 1 ;;
+    esac
+    oasis_wheels="bank-server/wheels/linux-$oasis_arch"
+    mkdir -p "$oasis_wheels"
+    if [ "$(find "$oasis_wheels" -name '*.whl' -type f | wc -l | tr -d ' ')" -eq 6 ]; then return; fi
+    for oasis_python in "${OASIS_PYTHON:-}" "/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3" /Applications/pgAdmin\ 4.app/Contents/Frameworks/Python.framework/Versions/*/bin/python3 python3; do
+        if [ -n "$oasis_python" ] && "$oasis_python" -m pip --version >/dev/null 2>&1; then
+            "$oasis_python" -m pip download --no-deps --require-hashes --only-binary=:all: \
+                --platform "manylinux_2_28_$oasis_platform" --platform "manylinux2014_$oasis_platform" \
+                --platform "manylinux_2_17_$oasis_platform" --python-version 313 --abi cp313 \
+                --implementation cp --dest "$oasis_wheels" -r bank-server/requirements.lock
+            return
+        fi
+    done
+    echo 'Для загрузки зависимостей нужен Python с pip. Можно указать его через OASIS_PYTHON.' >&2
+    exit 1
+}
+
+prepare_bank() {
+    prepare_env
+    dc up -d --wait postgres
+    prepare_wheels
+    dc build bank
+}
+
+wifi_ip() {
+    oasis_wifi_device="$(/usr/sbin/networksetup -listallhardwareports | /usr/bin/awk '/^Hardware Port: (Wi-Fi|AirPort)$/{getline; print $2; exit}')"
+    if [ -z "$oasis_wifi_device" ]; then
+        echo 'Интерфейс Wi-Fi не найден. Можно указать IPv4 явно: ./oasis network <IPv4>.' >&2
+        exit 1
+    fi
+    if ! oasis_host="$(/usr/sbin/ipconfig getifaddr "$oasis_wifi_device")" || [ -z "$oasis_host" ]; then
+        echo 'Подключите Mac к Wi-Fi с IPv4 или укажите IPv4 явно.' >&2
+        exit 1
+    fi
+    printf 'Wi-Fi: %s; IPv4 Mac: %s\n' "$oasis_wifi_device" "$oasis_host"
+}
+
+get_host() {
+    if [ "$#" -eq 1 ]; then oasis_host="$1"; else wifi_ip; fi
+    # Reject malformed values before starting/stopping any services.
+    if ! printf '%s\n' "$oasis_host" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i!~/^[0-9]+$/ || $i>255 || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; then
+        echo 'Нужен IPv4 вида 192.168.1.10.' >&2; exit 1
+    fi
+}
+
+backup_stopped_bank() {
+    mkdir -p backups
+    oasis_backup_dir="$(mktemp -d "$PWD/backups/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX")"
+    dc exec -T postgres pg_dump -U oasis -d oasis -Fc > "$oasis_backup_dir/database.dump"
+    admin snapshot > "$oasis_backup_dir/bank-keys.tar"
+    cp "$oasis_env" "$oasis_backup_dir/env"
+    printf 'project=%s\nbank_port=%s\ndb_port=%s\n' "${COMPOSE_PROJECT_NAME:-default}" "$oasis_port" "${OASIS_DB_PORT:-55432}" > "$oasis_backup_dir/context.txt"
+    printf 'database.dump + bank-keys.tar + env\n' > "$oasis_backup_dir/COMPLETE"
+    printf 'Резервная копия: %s\n' "$oasis_backup_dir"
+}
+
+stop_for_maintenance() {
+    dc stop bank
+    oasis_restart_on_exit=1
+}
+
+apply_tls() {
+    stop_for_maintenance
+    backup_stopped_bank
+    admin tls-apply
+    if ! dc up -d --wait bank; then
+        echo 'Новый TLS не прошёл проверку запуска; выполняется откат.' >&2
+        dc stop bank
+        admin tls-rollback
+        exit 1
+    fi
+    oasis_restart_on_exit=0
+    dc exec -T bank python bank.py --state /var/lib/oasis/keys --port "$oasis_port" show
+    echo 'На телефонах обновите адрес и TLS-отпечаток. Ключи, коды и история сохранены.'
+}
+
+usage() {
+    cat <<'HELP'
+Использование: ./oasis <команда>
+  network [IPv4]       Запуск в текущей Wi-Fi сети, при необходимости смена TLS
+  vpn <IPv4>           Запуск только на частном IPv4 Tailscale
+  start [IPv4]         Запуск без смены TLS; IPv4 обязателен только для нового банка
+  tls-issue [IPv4]     Подготовить сертификат (без замены активного)
+  tls-apply            Применить подготовленный сертификат и перезапустить банк
+  clients              Показать регистрации устройств
+  clients-reset [all|buyer|terminal]
+                       Удалить регистрации без связанных платежей, с резервной копией
+  backup               Снимок базы и ключей с краткой остановкой банка
+  doctor               Проверить банк и опубликованный адрес с Mac
+  status               Состояние контейнеров
+  logs                 Последние 100 строк журнала банка
+  show                 Адрес, TLS-отпечаток и коды ролей
+  ledger               Балансы и платежи
+  stop                 Остановка с сохранением данных
+  test                 Проверки в отдельной временной схеме
+HELP
+}
+
+case "${1:-help}" in
+    vpn)
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        get_host "$2"
+        if ! printf '%s\n' "$oasis_host" | awk -F. '$1 == 100 && $2 >= 64 && $2 <= 127 { found=1 } END { exit !found }'; then
+            echo 'Укажите IPv4 Mac из частной сети Tailscale (100.64.0.0/10).' >&2; exit 2
+        fi
+        export OASIS_BANK_BIND="$oasis_host"
+        exec "$PWD/oasis" network "$oasis_host"
+        ;;
+    network|tls-issue)
+        oasis_action="$1"; shift
+        [ "$#" -le 1 ] || { usage; exit 2; }
+        get_host "$@"
+        lock_maintenance
+        prepare_bank
+        if admin state-status; then oasis_initialized=1; else
+            oasis_result="$?"
+            [ "$oasis_result" -eq 3 ] || exit "$oasis_result"
+            oasis_initialized=0
+        fi
+        if [ "$oasis_initialized" -eq 0 ]; then
+            if [ "$oasis_action" = tls-issue ]; then
+                echo 'Сначала создайте банк: ./oasis network.' >&2; exit 1
+            fi
+            dc run --rm --no-deps -T bank --port "$oasis_port" init --host "$oasis_host" >/dev/null
+        elif [ "$oasis_action" = tls-issue ]; then
+            admin tls-issue --host "$oasis_host"
+            exit 0
+        elif admin network-ready --host "$oasis_host"; then :; else
+            oasis_result="$?"
+            [ "$oasis_result" -eq 3 ] || exit "$oasis_result"
+            admin tls-issue --host "$oasis_host"
+            apply_tls
+            exit 0
+        fi
+        dc up -d --wait bank
+        dc exec -T bank python bank.py --state /var/lib/oasis/keys --port "$oasis_port" show
+        ;;
+    start)
+        shift
+        [ "$#" -le 1 ] || { usage; exit 2; }
+        if [ "$#" -eq 1 ]; then get_host "$1"; fi
+        lock_maintenance
+        prepare_bank
+        if admin state-status; then
+            if [ "$#" -eq 1 ]; then
+                dc run --rm --no-deps -T bank show --expect-host "$oasis_host" >/dev/null
+            fi
+        else
+            oasis_result="$?"
+            [ "$oasis_result" -eq 3 ] || exit "$oasis_result"
+            [ "$#" -eq 1 ] || { echo 'Первый запуск: ./oasis network' >&2; exit 1; }
+            dc run --rm --no-deps -T bank --port "$oasis_port" init --host "$oasis_host" >/dev/null
+        fi
+        dc up -d --wait bank
+        dc exec -T bank python bank.py --state /var/lib/oasis/keys --port "$oasis_port" show
+        ;;
+    tls-apply)
+        [ "$#" -eq 1 ] || { usage; exit 2; }
+        lock_maintenance
+        prepare_bank
+        apply_tls
+        ;;
+    clients-reset)
+        [ "$#" -le 2 ] || { usage; exit 2; }
+        oasis_role="${2:-all}"
+        case "$oasis_role" in all|buyer|terminal) : ;; *) usage; exit 2 ;; esac
+        lock_maintenance
+        prepare_bank
+        stop_for_maintenance
+        backup_stopped_bank
+        admin clients-reset --role "$oasis_role"
+        dc up -d --wait bank
+        oasis_restart_on_exit=0
+        ;;
+    backup)
+        [ "$#" -eq 1 ] || { usage; exit 2; }
+        lock_maintenance
+        prepare_bank
+        stop_for_maintenance
+        backup_stopped_bank
+        ;;
+    clients)
+        lock_maintenance
+        prepare_bank
+        admin clients
+        ;;
+    doctor)
+        if ! docker info >/dev/null 2>&1; then
+            echo 'Docker не запущен. Откройте Docker Desktop, затем выполните ./oasis network.' >&2
+            exit 1
+        fi
+        dc ps
+        if ! dc exec -T bank python bank.py --state /var/lib/oasis/keys health; then
+            echo 'Банк не готов. Выполните ./oasis network и проверьте ./oasis logs.' >&2
+            exit 1
+        fi
+        oasis_published="$(dc port bank 8443)"
+        oasis_url="$(dc exec -T bank python bank.py --state /var/lib/oasis/keys --port "${oasis_published##*:}" show |
+            awk '$1 == "URL" { print $2 }')"
+        oasis_endpoint="${oasis_url#https://}"
+        echo "Адрес для Android: $oasis_url"
+        echo "Порт Docker: $oasis_published"
+        if ! /usr/bin/nc -z -w 3 "${oasis_endpoint%:*}" "${oasis_endpoint##*:}"; then
+            echo 'Адрес недоступен с Mac. Сверьте текущий IP и привязку порта, затем повторите ./oasis network.' >&2
+            exit 1
+        fi
+        echo 'Банк доступен с Mac. Проверьте тот же адрес в приложении на Android.'
+        ;;
+    status) dc ps ;;
+    logs) dc logs --tail 100 bank ;;
+    show|ledger)
+        dc exec -T bank python bank.py --state /var/lib/oasis/keys --port "$oasis_port" "$1"
+        ;;
+    stop) lock_maintenance; dc stop ;;
+    test)
+        lock_maintenance
+        prepare_bank
+        dc run --rm --no-deps -T --entrypoint python \
+            -e OASIS_TEST_DATABASE_URL=postgresql://oasis@postgres:5432/oasis bank -m unittest -v
+        ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 2 ;;
+esac

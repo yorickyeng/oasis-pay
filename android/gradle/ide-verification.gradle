@@ -1,0 +1,109 @@
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.jvm.JvmLibrary
+import org.gradle.language.base.artifact.SourcesArtifact
+import org.gradle.language.java.artifact.JavadocArtifact
+import org.gradle.api.attributes.Category
+import org.gradle.api.attributes.DocsType
+
+def verificationProject = project
+def verificationProjects = rootProject.allprojects
+def applicationProjects = [rootProject.project(':app')]
+
+// Studio resolves source archives in addition to the binaries used by assemble/test.
+// Keep this explicit task in the verification workflow when dependencies are updated.
+tasks.register('verifyIdeArtifacts') {
+    group = 'verification'
+    description = 'Verifies the sources and documentation requested by Android Studio sync.'
+    notCompatibleWithConfigurationCache('Source verification queries the current dependency model.')
+    doLast {
+        def components = new LinkedHashSet<ModuleComponentIdentifier>()
+        def variantSources = new LinkedHashSet<Map>()
+        def applicationComponents = new LinkedHashSet<ModuleComponentIdentifier>()
+        verificationProjects.each { project ->
+            project.buildscript.configurations.classpath.incoming.resolutionResult.allComponents.each {
+                if (it.id instanceof ModuleComponentIdentifier) components.add(it.id)
+            }
+            project.buildscript.configurations.classpath.incoming.artifacts.artifacts.each { artifact ->
+                def id = artifact.id.componentIdentifier
+                if (id instanceof ModuleComponentIdentifier) {
+                    def prefix = "${id.module}-${id.version}-"
+                    def name = artifact.file.name
+                    if (name.startsWith(prefix) && name.endsWith('.jar')) {
+                        variantSources.add([group: id.group, name: id.module, version: id.version,
+                            classifier: name.substring(prefix.length(), name.length() - 4) + '-sources', ext: 'jar'])
+                    }
+                }
+            }
+        }
+        def classpathNames = ['debugCompileClasspath', 'debugRuntimeClasspath',
+         'releaseCompileClasspath', 'releaseRuntimeClasspath',
+         'debugUnitTestCompileClasspath', 'debugUnitTestRuntimeClasspath',
+         'debugAndroidTestCompileClasspath', 'debugAndroidTestRuntimeClasspath']
+        applicationProjects.each { applicationProject ->
+            classpathNames.each { name ->
+                applicationProject.configurations.getByName(name).incoming.resolutionResult.allComponents.each {
+                    if (it.id instanceof ModuleComponentIdentifier) {
+                        components.add(it.id)
+                        applicationComponents.add(it.id)
+                    }
+                }
+            }
+        }
+        def verifyArchives = { componentIds, artifactType ->
+            def result = verificationProject.dependencies.createArtifactResolutionQuery()
+                .forComponents(componentIds)
+                .withArtifacts(JvmLibrary, artifactType)
+                .execute()
+            result.components.findAll {
+                it instanceof org.gradle.api.artifacts.result.UnresolvedComponentResult
+            }.each { throw it.failure }
+            def sources = 0
+            result.resolvedComponents.each { component ->
+                component.getArtifacts(artifactType).each { artifact ->
+                    if (artifact instanceof org.gradle.api.artifacts.result.ResolvedArtifactResult) {
+                        if (!artifact.file.isFile()) throw new GradleException("Missing sources: ${artifact.id}")
+                        sources++
+                    } else {
+                        // A published binary need not have sources. Every other failure,
+                        // including a checksum mismatch or network error, must fail this task.
+                        def cause = artifact.failure
+                        def notPublished = false
+                        while (cause != null) {
+                            notPublished |= cause.class.simpleName == 'ArtifactNotFoundException'
+                            cause = cause.cause
+                        }
+                        if (!notPublished) throw artifact.failure
+                    }
+                }
+            }
+            return sources
+        }
+        def sources = verifyArchives(components, SourcesArtifact)
+        def documentation = verifyArchives(applicationComponents, JavadocArtifact)
+        // Variant-aware AndroidX sources also contain sample archives. The legacy
+        // artifact query above only returns the primary sources JAR.
+        def androidSources = new LinkedHashSet<File>()
+        applicationProjects.each { applicationProject ->
+          classpathNames.each { name ->
+            def archives = applicationProject.configurations.getByName(name).incoming.artifactView {
+                withVariantReselection()
+                componentFilter { id -> id instanceof ModuleComponentIdentifier && id.group.startsWith('androidx.') }
+                attributes {
+                    attribute(Category.CATEGORY_ATTRIBUTE, applicationProject.objects.named(Category, Category.DOCUMENTATION))
+                    attribute(DocsType.DOCS_TYPE_ATTRIBUTE, applicationProject.objects.named(DocsType, DocsType.SOURCES))
+                }
+            }.files.files
+            androidSources.addAll(archives)
+          }
+        }
+        def androidArchives = androidSources.size()
+        variantSources.each { coordinates ->
+            def source = verificationProject.dependencies.create(
+                "${coordinates.group}:${coordinates.name}:${coordinates.version}:${coordinates.classifier}@jar")
+            def configuration = verificationProject.configurations.detachedConfiguration(source)
+            configuration.transitive = false
+            sources += configuration.files.size()
+        }
+        logger.lifecycle("Verified IDE archives: ${sources} sources, ${documentation} documentation, ${androidArchives} AndroidX variant archives")
+    }
+}

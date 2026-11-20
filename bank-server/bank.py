@@ -1,347 +1,475 @@
-"""HTTPS demo bank. Python 3.9+, SQLite, OpenSSL CLI."""
 import argparse
-import base64
-from contextlib import contextmanager
-import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
 import ipaddress
 import json
+import logging
 import os
-from pathlib import Path
 import re
 import secrets
-import sqlite3
 import ssl
-import subprocess
+import socket
 import tempfile
+import threading
 import time
+import uuid
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-DOMAIN = b"oasis-pay/v1\n"
-MAX_AMOUNT = 100_000
-OPENSSL = os.environ.get("OASIS_PAY_OPENSSL") or next(
-    (str(path) for path in (Path("/opt/homebrew/opt/openssl@3/bin/openssl"),
-                            Path("/usr/local/opt/openssl@3/bin/openssl")) if path.is_file()),
-    "openssl",
-)
+import psycopg
+from psycopg.rows import dict_row
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from admin import certificate_path
 
+from protocol import (LIMIT, ProtocolError, decode, digest, encode, message, payload,
+                      public_bytes, public_key, require, sign, verify)
 
-class Rejected(Exception):
-    def __init__(self, status, message):
-        self.status, self.message = status, message
-
-
-def check(condition, message="invalid_request", status=400):
-    if not condition:
-        raise Rejected(status, message)
-
-
-def openssl(*args, data=None):
-    return subprocess.run([OPENSSL, *map(str, args)], input=data, capture_output=True, check=True).stdout
-
-
-def encode(value):
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
+MERCHANT = "demo-merchant"
+BUYER = "demo-buyer"
+ENVIRONMENT = "sandbox"
+BINDINGS = ("terminal_id", "transaction_id", "order_id", "amount", "currency", "nonce", "merchant_id")
 
 
-def b64(data):
-    return base64.b64encode(data).decode("ascii")
+def now():
+    return int(time.time())
 
 
-def unb64(value):
-    return base64.b64decode(value, validate=True)
+def uuid_text(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
 
 
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def sign(key, value):
-    payload = encode(value)
-    signature = openssl("dgst", "-sha256", "-sign", key, data=DOMAIN + payload)
-    return {"payload": b64(payload), "signature": b64(signature)}
-
-
-def unpack(envelope):
-    check(isinstance(envelope, dict) and set(envelope) == {"payload", "signature"})
-    payload, signature = unb64(envelope["payload"]), unb64(envelope["signature"])
-    check(len(payload) <= 3000 and 8 <= len(signature) <= 80)
-    value = json.loads(payload)
-    check(isinstance(value, dict))
-    return payload, signature, value
-
-
-def verify(public_der, payload, signature):
-    with tempfile.TemporaryDirectory(prefix="oasis-verify-") as directory:
-        key, sig = Path(directory) / "key.der", Path(directory) / "signature"
-        key.write_bytes(public_der)
-        sig.write_bytes(signature)
-        try:
-            openssl("dgst", "-sha256", "-verify", key, "-keyform", "DER",
-                    "-signature", sig, data=DOMAIN + payload)
-        except subprocess.CalledProcessError:
-            raise Rejected(403, "invalid_signature") from None
-
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS terminals (
-    id TEXT PRIMARY KEY, public_key BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS account (
-    id INTEGER PRIMARY KEY CHECK (id = 1), balance INTEGER NOT NULL CHECK (balance >= 0)
-);
-CREATE TABLE IF NOT EXISTS payments (
-    terminal_id TEXT NOT NULL REFERENCES terminals(id),
-    transaction_id TEXT NOT NULL,
-    nonce TEXT NOT NULL,
-    request_hash TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('PAID', 'DECLINED')),
-    result BLOB NOT NULL,
-    delivered_at INTEGER,
-    PRIMARY KEY (terminal_id, transaction_id),
-    UNIQUE (terminal_id, nonce)
-);
-INSERT OR IGNORE INTO account VALUES (1, 500000);
-"""
+def fresh(created, expires, maximum):
+    moment = now()
+    return (type(created) is int and type(expires) is int
+            and moment - 30 <= expires and created <= moment + 30
+            and 0 < expires - created <= maximum)
 
 
 class Bank:
-    def __init__(self, state):
-        self.state = Path(state)
-        self.config = json.loads((self.state / "config.json").read_text())
-        self.signing_key = self.state / "bank.key"
-        self.public_key = openssl("pkey", "-in", self.signing_key, "-pubout", "-outform", "DER")
-        with self.db() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript(SCHEMA)
+    def __init__(self, state, dsn):
+        self.key = serialization.load_pem_private_key((state / "bank.key").read_bytes(), None)
+        self.settings = json.loads((state / "settings.json").read_text())
+        self.secret = bytes.fromhex(self.settings["secret"])
+        self.dsn = dsn
 
-    @contextmanager
-    def db(self):
-        db = sqlite3.connect(self.state / "ledger.sqlite3", timeout=10)
-        db.row_factory = sqlite3.Row
+    def connect(self):
+        options = psycopg.conninfo.conninfo_to_dict(self.dsn).get("options", "")
+        return psycopg.connect(self.dsn, row_factory=dict_row, connect_timeout=4,
+                               options=f"{options} -c statement_timeout=5000 -c lock_timeout=3500")
+
+    def token(self, device):
+        return hmac.digest(self.secret, ("buyer:" + device).encode(), "sha256").hex()
+
+    def enroll(self, db, role, raw, code):
+        expected = self.settings[role + "_code"]
+        require(hmac.compare_digest(expected, code), "unauthorized")
+        entry = payload(raw)
+        key = public_key(entry.get("public_key"))
+        verify(raw, key)
+        require(entry.get("type") == "enroll" and entry.get("role") == role
+                and entry.get("environment") == ENVIRONMENT)
+        model = entry.get("device_model")
+        require(isinstance(model, str) and 0 < len(model) <= 80)
+        device = digest(public_bytes(key)).hex()
+        db.execute("SELECT pg_advisory_xact_lock(%s)", (1 if role == "buyer" else 2,))
+        row = db.execute("SELECT * FROM devices WHERE id=%s", (device,)).fetchone()
+        if role == "terminal":
+            occupied = db.execute("SELECT id FROM devices WHERE role='terminal'").fetchone()
+            require(not occupied or occupied["id"] == device, "enrollment_unavailable")
+        if row:
+            require(row["role"] == role and not row["revoked"],
+                    "enrollment_unavailable")
+            certificate = row["certificate"]
+            if row["valid_to"] < now() + 86400 or "registration_number" not in payload(certificate):
+                moment = now()
+                validity = moment + 30 * 86400
+                certificate = sign(message("device_certificate", environment=ENVIRONMENT, device_id=device,
+                                           role=role, public_key=public_bytes(key), merchant_id=MERCHANT,
+                                           device_model=model, registration_number=self.registration_number(row),
+                                           valid_from=moment, valid_to=validity), self.key)
+                db.execute("UPDATE devices SET certificate=%s, valid_to=%s WHERE id=%s",
+                           (certificate, validity, device))
+        else:
+            account = None
+            if role == "buyer":
+                legacy_used = db.execute("SELECT 1 FROM devices WHERE account_id=%s", (BUYER,)).fetchone()
+                account = ("buyer-" + device) if legacy_used else BUYER
+                # Sandbox credit only; never a source of real money.
+                db.execute("INSERT INTO accounts(id,balance) VALUES(%s,500000) ON CONFLICT DO NOTHING", (account,))
+            row = db.execute("""INSERT INTO devices
+                (id,role,public_key,certificate,valid_to,account_id) VALUES(%s,%s,%s,%s,%s,%s)
+                RETURNING *""", (device, role, public_bytes(key), b"", 0, account)).fetchone()
+            moment = now()
+            validity = moment + 30 * 86400
+            certificate = sign(message("device_certificate", environment=ENVIRONMENT, device_id=device,
+                                       role=role, public_key=public_bytes(key), merchant_id=MERCHANT, device_model=model,
+                                       registration_number=self.registration_number(row),
+                                       valid_from=moment, valid_to=validity), self.key)
+            db.execute("UPDATE devices SET certificate=%s,valid_to=%s WHERE id=%s", (certificate, validity, device))
+        response = dict(certificate=certificate, bank_key=public_bytes(self.key.public_key()))
+        if role == "buyer":
+            response["access_token"] = self.token(device)
+        return response
+
+    @staticmethod
+    def registration_number(row):
+        prefix = "T" if row["role"] == "terminal" else "C"
+        return f"OP-{prefix}-{row['registration_number']:06d}"
+
+    def account(self, db, raw, token):
+        device, query = self.buyer(db, raw, token)
+        require(query.get("type") == "account_query" and
+                isinstance(query.get("nonce"), bytes) and len(query["nonce"]) == 32 and
+                type(query.get("created_at")) is int and abs(now() - query["created_at"]) <= 30,
+                "invalid_account_query")
+        row = db.execute("SELECT * FROM devices WHERE id=%s", (device,)).fetchone()
+        balance = db.execute("SELECT balance FROM accounts WHERE id=%s", (row["account_id"],)).fetchone()["balance"]
+        return dict(account=sign(message("account_snapshot", environment=ENVIRONMENT,
+            device_id=device, registration_number=self.registration_number(row),
+            balance=balance, currency="RUB", request_nonce=query["nonce"], observed_at=now()), self.key))
+
+    def buyer(self, db, raw, token):
+        authorization = payload(raw)
+        device = authorization.get("phone_device_id")
+        require(isinstance(device, str) and re.fullmatch(r"[0-9a-f]{64}", device), "unauthorized")
+        require(hmac.compare_digest(self.token(device), token), "unauthorized")
+        row = db.execute("SELECT * FROM devices WHERE id=%s AND role='buyer' FOR SHARE", (device,)).fetchone()
+        require(row and not row["revoked"] and row["valid_to"] >= now(), "unauthorized")
+        verify(raw, public_key(row["public_key"]))
+        require(authorization.get("environment") == ENVIRONMENT)
+        return device, authorization
+
+    def terminal_request(self, db, raw):
+        req = payload(raw)
+        terminal = req.get("terminal_id")
+        require(isinstance(terminal, str) and re.fullmatch(r"[0-9a-f]{64}", terminal))
+        # Serialize operations for one offline terminal before inspecting idempotency and sequence.
+        device = db.execute("SELECT * FROM devices WHERE id=%s AND role='terminal' FOR UPDATE",
+                            (terminal,)).fetchone()
+        require(device and not device["revoked"], "unknown_terminal")
+        verify(raw, public_key(device["public_key"]))
+        nonce = req.get("nonce")
+        description = req.get("description")
+        require(req.get("type") == "payment_request" and req.get("environment") == ENVIRONMENT
+                and req.get("merchant_id") == MERCHANT and req.get("currency") == "RUB"
+                and type(req.get("amount")) is int and 1 <= req["amount"] <= 100000
+                and uuid_text(req.get("transaction_id")) and uuid_text(req.get("order_id"))
+                and isinstance(nonce, bytes) and len(nonce) == 32
+                and type(req.get("terminal_sequence")) is int and 0 < req["terminal_sequence"] < 2**63
+                and isinstance(description, str) and 0 < len(description) <= 80
+                and req.get("capabilities") in (["ble-l2cap/1"], ["nfc-isodep/1"], ["ble-gatt/1"], ["ble-gatt/2"])
+                and type(req.get("created_at")) is int and 0 <= req["created_at"] < 2**62
+                and type(req.get("expires_at")) is int and 0 < req["expires_at"] - req["created_at"] <= 120)
+        return device, req
+
+    def result_response(self, result):
+        fields = payload(result)
+        moment = now()
+        permit = sign(message(
+            "result_permit", environment=ENVIRONMENT,
+            terminal_id=fields["terminal_id"], transaction_id=fields["transaction_id"],
+            phone_device_id=fields["phone_device_id"], request_hash=fields["request_hash"],
+            result_hash=digest(result), issued_at=moment, expires_at=moment + 300,
+        ), self.key)
+        return dict(result=result, permit=permit)
+
+    def payment(self, db, raw, token, mode):
+        preview = mode == "preview"
+        resolution = mode == "resolve"
+        buyer, authorization = self.buyer(db, raw, token)
+        kind = {"preview": "payment_preview", "resolve": "payment_resolution", "pay": "payment_authorization"}[mode]
+        require(authorization.get("type") == kind)
+        terminal_request = authorization.get("terminal_request")
+        device, req = self.terminal_request(db, terminal_request)
+        for name in BINDINGS:
+            require(type(req[name]) is type(authorization.get(name)) and req[name] == authorization[name])
+        key = (ENVIRONMENT, req["terminal_id"], req["transaction_id"])
+        request_hash = digest(terminal_request)
+        existing = db.execute("""SELECT * FROM payments
+            WHERE environment=%s AND terminal_id=%s AND transaction_id=%s""", key).fetchone()
+        if existing:
+            require(existing["request_hash"] == request_hash and existing["buyer_id"] == buyer, "conflict")
+            return (dict(amount=req["amount"], settled=True, merchant_id=MERCHANT) if preview
+                    else self.result_response(existing["result"]))
+        if resolution:
+            require(now() > req["expires_at"] + 30, "request_still_active")
+        else:
+            require(device["valid_to"] >= now(), "terminal_certificate_expired")
+            require(fresh(req["created_at"], req["expires_at"], 120), "request_expired")
+            require(req["terminal_sequence"] > device["last_sequence"], "sequence_replayed")
+        require(not db.execute("""SELECT 1 FROM payments WHERE environment=%s AND terminal_id=%s
+            AND (nonce=%s OR order_id=%s)""", (ENVIRONMENT, req["terminal_id"], req["nonce"],
+                                              req["order_id"])).fetchone(), "conflict")
+        if preview:
+            return dict(amount=req["amount"], settled=False, merchant_id=MERCHANT)
+        amount = req["amount"]
+        account = db.execute("SELECT account_id FROM devices WHERE id=%s", (buyer,)).fetchone()["account_id"]
+        debit = None
+        status = "CANCELLED"
+        if not resolution:
+            debit = db.execute("UPDATE accounts SET balance=balance-%s WHERE id=%s AND balance >= %s RETURNING id",
+                               (amount, account, amount)).fetchone()
+            status = "PAID" if debit else "DECLINED"
+        if debit:
+            db.execute("UPDATE accounts SET balance=balance+%s WHERE id=%s", (amount, MERCHANT))
+        operation = uuid.uuid4()
+        moment = now()
+        result = sign(message("payment_result", environment=ENVIRONMENT,
+                              **{name: req[name] for name in BINDINGS},
+                              status=status, server_operation_id=operation.hex, phone_device_id=buyer,
+                              request_hash=request_hash, processed_at=moment,
+                              result_nonce=secrets.token_bytes(32), expires_at=moment + 86400), self.key)
+        db.execute("""INSERT INTO payments
+            (environment,terminal_id,transaction_id,buyer_id,order_id,nonce,terminal_sequence,
+             request_hash,amount,status,operation_id,result) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   (*key, buyer, req["order_id"], req["nonce"], req["terminal_sequence"],
+                    request_hash, amount, status, operation, result))
+        if debit:
+            db.execute("INSERT INTO ledger VALUES (%s,%s,%s,%s)", (operation, account, MERCHANT, amount))
+        db.execute("UPDATE devices SET last_sequence=GREATEST(last_sequence,%s) WHERE id=%s", (req["terminal_sequence"], device["id"]))
+        db.execute("INSERT INTO outbox (operation_id,event) VALUES (%s,%s)", (operation, status))
+        return self.result_response(result)
+
+    def confirmation(self, db, raw, token, transaction):
+        buyer, relay = self.buyer(db, raw, token)
+        require(relay.get("type") == "relay_ack" and uuid_text(transaction))
+        ack_raw = relay.get("terminal_ack")
+        ack = payload(ack_raw)
+        terminal = ack.get("terminal_id")
+        require(isinstance(terminal, str) and re.fullmatch(r"[0-9a-f]{64}", terminal))
+        device = db.execute("SELECT * FROM devices WHERE id=%s AND role='terminal' FOR SHARE",
+                            (terminal,)).fetchone()
+        require(device and not device["revoked"], "unknown_terminal")
+        verify(ack_raw, public_key(device["public_key"]))
+        require(ack.get("type") == "payment_result_ack" and ack.get("environment") == ENVIRONMENT
+                and ack.get("transaction_id") == transaction and type(ack.get("received_at")) is int
+                and ack["received_at"] <= now() + 30)
+        row = db.execute("""SELECT * FROM payments WHERE environment=%s AND terminal_id=%s
+            AND transaction_id=%s AND buyer_id=%s FOR UPDATE""",
+                         (ENVIRONMENT, terminal, transaction, buyer)).fetchone()
+        state = ack.get("terminal_state")
+        require(row and ack.get("result_hash") == digest(row["result"])
+                and state in ("RECEIVED", "FULFILLED"))
+        require(state != "FULFILLED" or row["status"] == "PAID")
+        operation = row["operation_id"]
+        db.execute("UPDATE payments SET received_at=coalesce(received_at,now()) WHERE operation_id=%s", (operation,))
+        db.execute("INSERT INTO outbox (operation_id,event) VALUES (%s,'RECEIVED') ON CONFLICT DO NOTHING", (operation,))
+        if state == "FULFILLED":
+            db.execute("UPDATE payments SET fulfilled_at=coalesce(fulfilled_at,now()) WHERE operation_id=%s", (operation,))
+            db.execute("INSERT INTO outbox (operation_id,event) VALUES (%s,'FULFILLED') ON CONFLICT DO NOTHING", (operation,))
+        return dict(terminal_state="FULFILLED" if state == "FULFILLED" or row["fulfilled_at"] else "RECEIVED")
+
+    def dispatch(self, path, raw, token):
+        with self.connect() as db:
+            if path in ("/api/v1/enroll/terminal", "/api/v1/enroll/buyer"):
+                return self.enroll(db, path.rsplit("/", 1)[1], raw, token)
+            if path == "/api/v1/account":
+                return self.account(db, raw, token)
+            if path in ("/api/v1/payments", "/api/v1/payments/preview", "/api/v1/payments/resolve"):
+                mode = "pay" if path == "/api/v1/payments" else path.rsplit("/", 1)[1]
+                return self.payment(db, raw, token, mode)
+            match = re.fullmatch(r"/api/v1/payments/([0-9a-f]{32})/delivery-confirmation", path)
+            require(match, "not_found")
+            return self.confirmation(db, raw, token, match[1])
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    def __init__(self, address, bank, tls):
+        self.bank, self.tls = bank, tls
+        self.slots = threading.BoundedSemaphore(24)
+        super().__init__(address, Handler)
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
         try:
-            with db:
-                db.execute("PRAGMA foreign_keys=ON")
-                yield db
-        finally:
-            db.close()
+            super().process_request(request, address)
+        except BaseException:
+            self.slots.release()
+            raise
 
-    def auth(self, role, authorization):
-        actual = authorization.encode("utf-8")
-        expected = ("Bearer " + self.config[role]).encode()
-        check(secrets.compare_digest(actual, expected), "unauthorized", 401)
-
-    def enroll(self, value):
-        public = unb64(value["public_key"])
-        check(len(public) == 91)
-        p256_prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004")
-        check(public.startswith(p256_prefix), "expected_p256_key")
+    @staticmethod
+    def expire_connection(connection):
         try:
-            openssl("pkey", "-pubin", "-inform", "DER", "-pubcheck", "-noout", data=public)
-        except subprocess.CalledProcessError:
-            raise Rejected(400, "invalid_public_key") from None
-        terminal_id = digest(public)
-        with self.db() as db:
-            db.execute("INSERT OR IGNORE INTO terminals VALUES (?, ?)", (terminal_id, public))
-        return {"terminal_id": terminal_id, "bank_key": b64(self.public_key)}
-
-    def signed_terminal_message(self, db, envelope, kind):
-        payload, signature, value = unpack(envelope)
-        check(value.get("type") == kind)
-        terminal_id = value["terminal_id"]
-        check(isinstance(terminal_id, str) and re.fullmatch("[0-9a-f]{64}", terminal_id))
-        terminal = db.execute("SELECT public_key FROM terminals WHERE id=?", (terminal_id,)).fetchone()
-        check(terminal is not None, "unknown_terminal", 403)
-        verify(terminal["public_key"], payload, signature)
-        return payload, value
-
-    def payment(self, envelope, *, preview=False):
-        with self.db() as db:
-            raw, request = self.signed_terminal_message(db, envelope, "payment_request")
-            fields = {"type", "terminal_id", "transaction_id", "nonce", "amount",
-                      "currency", "created_at", "expires_at"}
-            check(set(request) == fields and request["currency"] == "RUB")
-            terminal_id, tx, nonce, amount, created, expires = (
-                request[k] for k in ("terminal_id", "transaction_id", "nonce", "amount",
-                                     "created_at", "expires_at")
-            )
-            check(isinstance(tx, str) and re.fullmatch("[0-9a-f]{32}", tx))
-            check(isinstance(nonce, str) and re.fullmatch("[0-9a-f]{64}", nonce))
-            check(type(amount) is int and 0 < amount <= MAX_AMOUNT)
-            check(type(created) is int and type(expires) is int and 0 < expires - created <= 300)
-            if not preview:
-                db.execute("BEGIN IMMEDIATE")
-            existing = db.execute(
-                "SELECT * FROM payments WHERE terminal_id=? AND transaction_id=?", (terminal_id, tx)
-            ).fetchone()
-            if existing:
-                check(existing["request_hash"] == digest(raw), "transaction_conflict", 409)
-                if not preview:
-                    return json.loads(existing["result"])
-            else:
-                now = int(time.time())
-                check(created <= now + 60 and now <= expires, "request_expired_or_clock_skew", 409)
-            if preview:
-                return {"amount": amount, "currency": "RUB", "transaction_id": tx,
-                        "settled": existing["status"] if existing else None}
-            check(db.execute("SELECT 1 FROM payments WHERE terminal_id=? AND nonce=?",
-                             (terminal_id, nonce)).fetchone() is None, "nonce_reused", 409)
-            debit = db.execute("UPDATE account SET balance=balance-? WHERE id=1 AND balance>=?",
-                               (amount, amount))
-            status = "PAID" if debit.rowcount == 1 else "DECLINED"
-            now = int(time.time())
-            result = sign(self.signing_key, {
-                "type": "payment_result", "terminal_id": terminal_id, "transaction_id": tx,
-                "nonce": nonce, "amount": amount, "currency": "RUB", "status": status,
-                "request_hash": digest(raw), "processed_at": now, "expires_at": now + 86400,
-            })
-            db.execute("INSERT INTO payments VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-                       (terminal_id, tx, nonce, digest(raw), amount, status, encode(result)))
-            return result
-
-    def acknowledge(self, envelope):
-        with self.db() as db:
-            _, ack = self.signed_terminal_message(db, envelope, "delivery_ack")
-            check(set(ack) == {"type", "terminal_id", "transaction_id", "result_hash"})
-            row = db.execute("SELECT result FROM payments WHERE terminal_id=? AND transaction_id=?",
-                             (ack["terminal_id"], ack["transaction_id"])).fetchone()
-            check(row is not None, "unknown_transaction", 404)
-            result_payload = unb64(json.loads(row["result"])["payload"])
-            check(ack["result_hash"] == digest(result_payload), "wrong_result")
-            db.execute(
-                "UPDATE payments SET delivered_at=COALESCE(delivered_at, ?) "
-                "WHERE terminal_id=? AND transaction_id=?",
-                (int(time.time()), ack["terminal_id"], ack["transaction_id"]),
-            )
-        return {"received": True}
-
-    def handle(self, method, path, authorization, body):
-        if method == "GET" and path == "/health":
-            return {"status": "ok"}
-        check(method == "POST", "not_found", 404)
-        if path == "/v1/enroll":
-            self.auth("enrollment_code", authorization)
-            return self.enroll(body)
-        if path in ("/v1/preview", "/v1/pay", "/v1/ack"):
-            self.auth("payer_code", authorization)
-            if path == "/v1/ack":
-                return self.acknowledge(body)
-            return self.payment(body, preview=path == "/v1/preview")
-        raise Rejected(404, "not_found")
-
-
-class Handler(BaseHTTPRequestHandler):
-    def setup(self):
-        self.request.settimeout(10)
-        super().setup()
-
-    def respond(self):
-        try:
-            body = None
-            if self.command == "POST":
-                size = int(self.headers.get("Content-Length", "0"))
-                check(0 < size <= 8192, "invalid_body_length", 413)
-                check(self.headers.get_content_type() == "application/json", "expected_json", 415)
-                body = json.loads(self.rfile.read(size))
-                check(isinstance(body, dict))
-            value = self.server.bank.handle(self.command, self.path, self.headers.get("Authorization", ""), body)
-            code = 200
-        except Rejected as error:
-            code, value = error.status, {"error": error.message}
-        except (ValueError, TypeError, KeyError, TimeoutError, RecursionError):
-            code, value = 400, {"error": "invalid_request"}
-        except (sqlite3.Error, subprocess.CalledProcessError, OSError) as error:
-            self.log_error("%s", type(error).__name__)
-            code, value = 500, {"error": "bank_unavailable"}
-        output = encode(value)
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(output)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            self.wfile.write(output)
+            connection.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
-    do_GET = respond
-    do_POST = respond
+    def process_request_thread(self, request, address):
+        try:
+            request.settimeout(8)
+            with self.tls.wrap_socket(request, server_side=True) as secured:
+                deadline = threading.Timer(20, self.expire_connection, args=(secured,))
+                deadline.daemon = True
+                deadline.start()
+                try:
+                    self.finish_request(secured, address)
+                finally:
+                    deadline.cancel()
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            self.shutdown_request(request)
+            self.slots.release()
 
 
-def initialize(state, host):
-    host = str(ipaddress.IPv4Address(host))
-    state.mkdir(mode=0o700, parents=True, exist_ok=False)
-    openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
-            "-out", state / "bank.key")
-    openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-            "-nodes", "-days", "30", "-subj", "/CN=Oasis Pay Demo Bank",
-            "-addext", f"subjectAltName=IP:{host},IP:127.0.0.1",
-            "-addext", "basicConstraints=critical,CA:FALSE",
-            "-addext", "keyUsage=critical,digitalSignature",
-            "-addext", "extendedKeyUsage=serverAuth",
-            "-keyout", state / "tls.key", "-out", state / "tls.crt")
-    config = {"host": host, "enrollment_code": secrets.token_urlsafe(24),
-              "payer_code": secrets.token_urlsafe(24)}
-    (state / "config.json").write_bytes(encode(config))
-    Bank(state)
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def reply(self, status, value):
+        body = encode(value)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/cbor")
+        self.send_header("Cache-Control", "no-store")
+        # This bounded server handles one HTTP request per TLS connection.
+        # Explicitly prevent clients from pooling a socket that is about to close.
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/health":
+            self.reply(404, {"error": "not_found"})
+            return
+        try:
+            with self.server.bank.connect() as db:
+                db.execute("SELECT 1 FROM accounts LIMIT 1")
+            self.reply(200, {"status": "ok", "environment": ENVIRONMENT, "server_time": now()})
+        except psycopg.Error:
+            self.reply(503, {"error": "database_unavailable"})
+
+    def do_POST(self):
+        try:
+            require(self.headers.get("Content-Type") == "application/cbor", "invalid_content_type")
+            require(not self.headers.get("Transfer-Encoding"), "invalid_length")
+            lengths = self.headers.get_all("Content-Length", [])
+            require(len(lengths) == 1 and re.fullmatch(r"[0-9]{1,5}", lengths[0]), "invalid_length")
+            size = int(lengths[0])
+            require(0 < size <= LIMIT, "invalid_length")
+            require(len(self.headers.get_all("Authorization", [])) == 1, "unauthorized")
+            auth = self.headers.get("Authorization", "")
+            require(re.fullmatch(r"Bearer [A-Za-z0-9_-]{32,64}", auth), "unauthorized")
+            raw = self.rfile.read(size)
+            require(len(raw) == size)
+            response = self.server.bank.dispatch(self.path, raw, auth[7:])
+        except ProtocolError as exc:
+            code = str(exc)
+            self.reply({"unauthorized": 401, "not_found": 404, "conflict": 409}.get(code, 400), {"error": code})
+        except ValueError:
+            self.reply(400, {"error": "invalid_message"})
+        except psycopg.Error as exc:
+            logging.error("Database operation failed (%s)", exc.sqlstate)
+            self.reply(503, {"error": "database_unavailable"})
+        else:
+            self.reply(200, response)
+
+
+def pem_key(key):
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption())
+
+
+def initialize(state, host, dsn):
+    ip = ipaddress.IPv4Address(host)
+    require(not state.exists(), "bank_state_exists")
+    with psycopg.connect(dsn, connect_timeout=4) as db:
+        db.execute(Path(__file__).with_name("schema.sql").read_text())
+    tls_key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "oasis pay sandbox")])
+    date = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(tls_key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(date - timedelta(minutes=5)).not_valid_after(date + timedelta(days=30))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ip), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+            .sign(tls_key, hashes.SHA256()))
+    with tempfile.TemporaryDirectory(prefix=".initializing-", dir=state.parent) as temporary:
+        staging = Path(temporary)
+        (staging / "tls.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        (staging / "tls.key").write_bytes(pem_key(tls_key))
+        (staging / "bank.key").write_bytes(pem_key(ec.generate_private_key(ec.SECP256R1())))
+        settings = dict(host=host, terminal_code=secrets.token_urlsafe(24), buyer_code=secrets.token_urlsafe(24),
+                        secret=secrets.token_hex(32), pin=cert.fingerprint(hashes.SHA256()).hex())
+        (staging / "settings.json").write_text(json.dumps(settings))
+        staging.rename(state)
+
+
+def migrate(bank):
+    with bank.connect() as db:
+        db.execute("SELECT pg_advisory_xact_lock(20491104)")
+        db.execute(Path(__file__).with_name("schema.sql").read_text())
 
 
 def show(state, port):
-    bank = Bank(state)
-    certificate = ssl.PEM_cert_to_DER_cert((state / "tls.crt").read_text())
-    print("URL:", f"https://{bank.config['host']}:{port}")
-    print("Отпечаток TLS (SHA-256):", digest(certificate))
-    print("Код терминала:", bank.config["enrollment_code"])
-    print("Код покупателя:", bank.config["payer_code"])
-
-
-def serve(state, bind, port):
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_3
-    context.load_cert_chain(state / "tls.crt", state / "tls.key")
-
-    class BankServer(ThreadingHTTPServer):
-        def finish_request(self, request, address):
-            request.settimeout(10)
-            try:
-                with context.wrap_socket(request, server_side=True) as secure:
-                    super().finish_request(secure, address)
-            except (ssl.SSLError, OSError):
-                return
-
-    with BankServer((bind, port), Handler) as server:
-        server.bank = Bank(state)
-        print(f"Банк запущен на {bind}:{server.server_port}", flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
+    settings = json.loads((state / "settings.json").read_text())
+    print(f"URL              https://{settings['host']}:{port}")
+    for field, label in (("pin", "TLS SHA-256"), ("terminal_code", "Код кассы"), ("buyer_code", "Код покупателя")):
+        print(f"{label:16} {settings[field]}")
 
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state", type=Path, default=Path(__file__).resolve().parent / ".bank")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--state", type=Path, default=Path(".bank"))
     parser.add_argument("--port", type=int, default=8443)
-    commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init")
-    init.add_argument("--host", required=True, help="IPv4-адрес Mac, доступный покупателю")
-    commands.add_parser("show")
-    run = commands.add_parser("serve")
-    run.add_argument("--bind", default="0.0.0.0")
-    commands.add_parser("ledger")
+    commands = parser.add_subparsers(dest="action", required=True)
+    commands.add_parser("init").add_argument("--host", required=True)
+    commands.add_parser("show").add_argument("--expect-host")
+    for name in ("serve", "migrate", "ledger", "health"):
+        commands.add_parser(name)
     args = parser.parse_args()
-    if args.command == "init":
-        initialize(args.state, args.host)
-    if args.command in ("init", "show"):
+    dsn = os.environ.get("OASIS_DATABASE_URL", "")
+    if args.action == "show":
+        if args.expect_host:
+            stored = json.loads((args.state / "settings.json").read_text())["host"]
+            if stored != args.expect_host:
+                parser.error(f"Сохранённый сертификат выдан для {stored}")
         show(args.state, args.port)
-    elif args.command == "serve":
-        serve(args.state, args.bind, args.port)
-    elif args.command == "ledger":
-        with Bank(args.state).db() as db:
-            print("Баланс, коп.:", db.execute("SELECT balance FROM account").fetchone()[0])
-            for row in db.execute("SELECT transaction_id, amount, status, delivered_at FROM payments"):
-                print(dict(row))
+        return
+    if args.action == "health":
+        context = ssl.create_default_context(cafile=str(certificate_path(args.state)))
+        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+        with urllib.request.urlopen(f"https://127.0.0.1:{args.port}/health", context=context, timeout=2) as response:
+            require(decode(response.read()).get("status") == "ok", "unhealthy")
+        return
+    if not dsn:
+        parser.error("Set OASIS_DATABASE_URL")
+    if args.action == "init":
+        initialize(args.state, args.host, dsn)
+        show(args.state, args.port)
+        return
+    bank = Bank(args.state, dsn)
+    if args.action == "migrate":
+        migrate(bank)
+    elif args.action == "ledger":
+        with bank.connect() as db:
+            for row in db.execute("SELECT * FROM accounts ORDER BY id"):
+                print(row)
+            for row in db.execute("""SELECT transaction_id, amount, status, received_at, fulfilled_at
+                FROM payments ORDER BY operation_id"""):
+                print(row)
+    else:
+        migrate(bank)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.num_tickets = 0
+        context.load_cert_chain(certificate_path(args.state), args.state / "tls.key")
+        print(f"oasis pay sandbox is listening on port {args.port}", flush=True)
+        with Server(("0.0.0.0", args.port), bank, context) as server:
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == "__main__":

@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+umask 077
+cd "$(dirname "$0")"
+oasis_root="$(pwd -P)"
+studio_jdk="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+if [ -z "${JAVA_HOME:-}" ] && [ -x "$studio_jdk/bin/java" ]; then
+    export JAVA_HOME="$studio_jdk"
+fi
+if [ -z "${ANDROID_HOME:-}" ] && [ -d "$HOME/Library/Android/sdk" ]; then
+    export ANDROID_HOME="$HOME/Library/Android/sdk"
+fi
+keytool="${JAVA_HOME:+$JAVA_HOME/bin/}keytool"
+mkdir -p .signing
+if [ ! -e .signing/release.p12 ]; then
+    if [ ! -e .signing/password ]; then
+        (set -C; openssl rand -hex 24 > .signing/password)
+    fi
+    "$keytool" -genkeypair -alias oasis-pay -keyalg EC -groupname secp256r1 -validity 10000 \
+        -dname "CN=oasis pay sandbox" -storetype PKCS12 -keystore .signing/release.p12 \
+        -storepass:file .signing/password
+fi
+export OASIS_ANDROID_KEYSTORE="$oasis_root/.signing/release.p12"
+OASIS_ANDROID_KEY_PASSWORD="$(cat .signing/password)"
+export OASIS_ANDROID_KEY_PASSWORD
+(
+    cd android
+    ./gradlew "$@" :app:testDebugUnitTest :app:assembleRelease
+)
+oasis_apk_tmp="$(mktemp "$oasis_root/.oasis-apk.XXXXXX")"
+trap 'rm -f "$oasis_apk_tmp"' EXIT HUP INT TERM
+cp android/app/build/outputs/apk/release/app-release.apk "$oasis_apk_tmp"
+mv -f "$oasis_apk_tmp" oasis-pay.apk
+printf 'APK: %s/oasis-pay.apk\n' "$oasis_root"
