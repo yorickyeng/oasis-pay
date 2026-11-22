@@ -29,6 +29,22 @@ start_postgres() {
     fi
 }
 
+usage() {
+    cat <<'HELP'
+Использование: sh termux-oasis <команда>
+  setup                         Установить зависимости
+  start [IPv4]                  Запустить банк в текущем сеансе
+  show                          Показать URL, отпечаток TLS и коды ролей
+  health                        Проверить HTTPS и базу
+  clients                       Показать регистрации кассы и покупателей
+  clients-reset all|terminal|buyer
+                                Удалить регистрации, если с ними нет платежей
+  ledger                        Показать счета и платежи
+  stop-db                       Остановить PostgreSQL после остановки банка
+  help                          Показать эту справку
+HELP
+}
+
 case "${1:-help}" in
     setup)
         pkg install python python-pip python-cryptography postgresql
@@ -58,13 +74,29 @@ case "${1:-help}" in
         printf '\nНа телефоне, где запущен Termux: https://127.0.0.1:8443\n\n'
         exec "$python" bank-server/bank.py --state "$keys_dir" serve
         ;;
-    show|health|ledger)
+    show|ledger)
         bank "$1"
+        ;;
+    health)
+        bank health
+        echo 'Банк доступен.'
+        ;;
+    clients)
+        admin clients
+        ;;
+    clients-reset)
+        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+        case "$2" in
+            all|terminal|buyer) admin clients-reset --role "$2" ;;
+            *) usage >&2; exit 2 ;;
+        esac
         ;;
     stop-db)
         pg_ctl -D "$pg_dir" -m fast -w stop
         ;;
+    help|-h|--help) usage ;;
     *)
-        printf '%s\n' 'sh termux-oasis setup | start [IPv4 Android] | show | health | ledger | stop-db'
+        usage >&2
+        exit 2
         ;;
 esac

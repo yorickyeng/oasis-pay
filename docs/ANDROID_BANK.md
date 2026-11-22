@@ -33,4 +33,16 @@ sh termux-oasis setup
 
 При изменении IP S25 остановите банк и снова запустите его с новым IPv4. Файл сертификата и отпечаток обновятся, существующие ключи банка и записи базы сохранятся. Чтобы повторно посмотреть параметры, откройте второй сеанс Termux и выполните `sh termux-oasis show` из каталога проекта.
 
+## Управление банком
+
+Чтобы выполнить команду, пока банк работает, откройте второй сеанс Termux. Смахните от левого края экрана вправо и нажмите **New session**. В новом сеансе выполните:
+
+```sh
+cd ~/oasis-pay
+sh termux-oasis help
+sh termux-oasis clients
+```
+
+Команда `sh termux-oasis clients-reset all` удаляет регистрации кассы и покупателей. Если хотя бы одна регистрация связана с платежом, банк отменит весь сброс. Чтобы освободить только кассу или только покупателей, укажите `terminal` или `buyer` вместо `all`. Затем заново подключите устройства в Oasis Pay с кодами из `sh termux-oasis show`.
+
 [Termux для Android](https://github.com/termux/termux-app#installation) · [PostgreSQL в Termux](https://github.com/termux/termux-packages/blob/master/packages/postgresql/build.sh)
