@@ -82,3 +82,21 @@ BEGIN
     END IF;
 END
 $migration$;
+
+-- v4: independent terminals, revived registrations receive fresh access tokens.
+DO $migration$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version=4) THEN
+        DROP INDEX IF EXISTS devices_single_terminal;
+        ALTER TABLE devices ADD COLUMN token_nonce bytea
+            CHECK (token_nonce IS NULL OR (role = 'buyer' AND octet_length(token_nonce) = 32));
+        INSERT INTO schema_migrations VALUES (4);
+    END IF;
+END
+$migration$;
+
+CREATE TABLE IF NOT EXISTS sandbox_state (
+    singleton boolean PRIMARY KEY CHECK (singleton),
+    reset_at bigint NOT NULL CHECK (reset_at >= 0)
+);
+INSERT INTO sandbox_state VALUES (true, 0) ON CONFLICT (singleton) DO NOTHING;

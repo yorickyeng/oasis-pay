@@ -23,7 +23,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-from admin import certificate_path
+from admin import BANK_MAINTENANCE_LOCK, certificate_path
 
 from protocol import (LIMIT, ProtocolError, decode, digest, encode, message, payload,
                       public_bytes, public_key, require, sign, verify)
@@ -61,8 +61,12 @@ class Bank:
         return psycopg.connect(self.dsn, row_factory=dict_row, connect_timeout=4,
                                options=f"{options} -c statement_timeout=5000 -c lock_timeout=3500")
 
-    def token(self, device):
-        return hmac.digest(self.secret, ("buyer:" + device).encode(), "sha256").hex()
+    def token(self, device, nonce):
+        identity = ("buyer:" + device).encode()
+        # Existing registrations without a nonce retain their original bearer token.
+        if nonce is not None:
+            identity += b":" + nonce
+        return hmac.digest(self.secret, identity, "sha256").hex()
 
     def enroll(self, db, role, raw, code):
         expected = self.settings[role + "_code"]
@@ -77,9 +81,6 @@ class Bank:
         device = digest(public_bytes(key)).hex()
         db.execute("SELECT pg_advisory_xact_lock(%s)", (1 if role == "buyer" else 2,))
         row = db.execute("SELECT * FROM devices WHERE id=%s", (device,)).fetchone()
-        if role == "terminal":
-            occupied = db.execute("SELECT id FROM devices WHERE role='terminal'").fetchone()
-            require(not occupied or occupied["id"] == device, "enrollment_unavailable")
         if row:
             require(row["role"] == role and not row["revoked"],
                     "enrollment_unavailable")
@@ -100,9 +101,10 @@ class Bank:
                 account = ("buyer-" + device) if legacy_used else BUYER
                 # Sandbox credit only; never a source of real money.
                 db.execute("INSERT INTO accounts(id,balance) VALUES(%s,500000) ON CONFLICT DO NOTHING", (account,))
+            token_nonce = secrets.token_bytes(32) if role == "buyer" else None
             row = db.execute("""INSERT INTO devices
-                (id,role,public_key,certificate,valid_to,account_id) VALUES(%s,%s,%s,%s,%s,%s)
-                RETURNING *""", (device, role, public_bytes(key), b"", 0, account)).fetchone()
+                (id,role,public_key,certificate,valid_to,account_id,token_nonce) VALUES(%s,%s,%s,%s,%s,%s,%s)
+                RETURNING *""", (device, role, public_bytes(key), b"", 0, account, token_nonce)).fetchone()
             moment = now()
             validity = moment + 30 * 86400
             certificate = sign(message("device_certificate", environment=ENVIRONMENT, device_id=device,
@@ -112,7 +114,7 @@ class Bank:
             db.execute("UPDATE devices SET certificate=%s,valid_to=%s WHERE id=%s", (certificate, validity, device))
         response = dict(certificate=certificate, bank_key=public_bytes(self.key.public_key()))
         if role == "buyer":
-            response["access_token"] = self.token(device)
+            response["access_token"] = self.token(device, row["token_nonce"])
         return response
 
     @staticmethod
@@ -136,9 +138,9 @@ class Bank:
         authorization = payload(raw)
         device = authorization.get("phone_device_id")
         require(isinstance(device, str) and re.fullmatch(r"[0-9a-f]{64}", device), "unauthorized")
-        require(hmac.compare_digest(self.token(device), token), "unauthorized")
         row = db.execute("SELECT * FROM devices WHERE id=%s AND role='buyer' FOR SHARE", (device,)).fetchone()
-        require(row and not row["revoked"] and row["valid_to"] >= now(), "unauthorized")
+        require(row and not row["revoked"] and row["valid_to"] >= now() and
+                hmac.compare_digest(self.token(device, row["token_nonce"]), token), "unauthorized")
         verify(raw, public_key(row["public_key"]))
         require(authorization.get("environment") == ENVIRONMENT)
         return device, authorization
@@ -164,6 +166,8 @@ class Bank:
                 and req.get("capabilities") in (["ble-l2cap/1"], ["nfc-isodep/1"], ["ble-gatt/1"], ["ble-gatt/2"])
                 and type(req.get("created_at")) is int and 0 <= req["created_at"] < 2**62
                 and type(req.get("expires_at")) is int and 0 < req["expires_at"] - req["created_at"] <= 120)
+        reset_at = db.execute("SELECT reset_at FROM sandbox_state").fetchone()["reset_at"]
+        require(not reset_at or req["created_at"] > reset_at, "request_expired")
         return device, req
 
     def result_response(self, result):
@@ -265,6 +269,7 @@ class Bank:
 
     def dispatch(self, path, raw, token):
         with self.connect() as db:
+            db.execute("SELECT pg_advisory_xact_lock_shared(%s)", (BANK_MAINTENANCE_LOCK,))
             if path in ("/api/v1/enroll/terminal", "/api/v1/enroll/buyer"):
                 return self.enroll(db, path.rsplit("/", 1)[1], raw, token)
             if path == "/api/v1/account":
@@ -406,7 +411,7 @@ def initialize(state, host, dsn):
 
 def migrate(bank):
     with bank.connect() as db:
-        db.execute("SELECT pg_advisory_xact_lock(20491104)")
+        db.execute("SELECT pg_advisory_xact_lock(%s)", (BANK_MAINTENANCE_LOCK,))
         db.execute(Path(__file__).with_name("schema.sql").read_text())
 
 

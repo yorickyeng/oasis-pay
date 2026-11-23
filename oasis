@@ -133,6 +133,7 @@ usage() {
   clients              Показать регистрации устройств
   clients-reset [all|buyer|terminal]
                        Удалить регистрации без связанных платежей, с резервной копией
+  reset                Очистить выбранный тестовый банк, включая платежи и регистрации
   backup               Снимок базы и ключей с краткой остановкой банка
   doctor               Проверить банк и опубликованный адрес с Mac
   status               Состояние контейнеров
@@ -217,6 +218,18 @@ case "${1:-help}" in
         stop_for_maintenance
         backup_stopped_bank
         admin clients-reset --role "$oasis_role"
+        dc up -d --wait bank
+        oasis_restart_on_exit=0
+        ;;
+    reset)
+        [ "$#" -eq 1 ] || { usage; exit 2; }
+        lock_maintenance
+        prepare_bank
+        admin state-status
+        stop_for_maintenance
+        backup_stopped_bank
+        dc run --rm --no-deps -T bank migrate
+        admin reset
         dc up -d --wait bank
         oasis_restart_on_exit=0
         ;;

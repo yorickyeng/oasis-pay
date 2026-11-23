@@ -18,6 +18,8 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from protocol import payload
 
+BANK_MAINTENANCE_LOCK = 20491104
+
 
 def atomic_write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -167,6 +169,7 @@ def clients(dsn):
 def reset_clients(dsn, role):
     with psycopg.connect(dsn, connect_timeout=4) as db:
         db.execute("SET LOCAL lock_timeout = '10s'")
+        db.execute("SELECT pg_advisory_xact_lock(%s)", (BANK_MAINTENANCE_LOCK,))
         db.execute('LOCK TABLE devices, payments IN ACCESS EXCLUSIVE MODE')
         rows = db.execute('SELECT id, role FROM devices WHERE (%s = \'all\' OR role=%s)',
                           (role, role)).fetchall()
@@ -180,6 +183,18 @@ def reset_clients(dsn, role):
         print('Удалено регистраций:', len(ids))
 
 
+def reset_sandbox(dsn):
+    with psycopg.connect(dsn, connect_timeout=4) as db:
+        db.execute("SET LOCAL lock_timeout = '10s'")
+        db.execute("SELECT pg_advisory_xact_lock(%s)", (BANK_MAINTENANCE_LOCK,))
+        if db.execute("SELECT to_regclass('sandbox_state')").fetchone()[0] is None:
+            raise ValueError('Перезапустите банк после обновления, затем повторите reset.')
+        db.execute("TRUNCATE outbox, ledger, payments, devices, accounts")
+        db.execute("INSERT INTO accounts(id,balance) VALUES ('demo-buyer',500000), ('demo-merchant',0)")
+        db.execute("UPDATE sandbox_state SET reset_at = floor(extract(epoch FROM clock_timestamp()))")
+    print('Тестовый банк очищен. Начальные балансы восстановлены.')
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -187,7 +202,7 @@ def main():
     sub = parser.add_subparsers(dest='action', required=True)
     for action in ('tls-issue', 'network-ready'):
         sub.add_parser(action).add_argument('--host', required=True)
-    for action in ('tls-apply', 'tls-rollback', 'state-status', 'snapshot', 'clients'):
+    for action in ('tls-apply', 'tls-rollback', 'state-status', 'snapshot', 'clients', 'reset'):
         sub.add_parser(action)
     sub.add_parser('clients-reset').add_argument('--role', choices=('all', 'buyer', 'terminal'), default='all')
     args = parser.parse_args()
@@ -217,6 +232,8 @@ def main():
                 clients(os.environ['OASIS_DATABASE_URL'])
             elif args.action == 'clients-reset':
                 reset_clients(os.environ['OASIS_DATABASE_URL'], args.role)
+            elif args.action == 'reset':
+                reset_sandbox(os.environ['OASIS_DATABASE_URL'])
         except (ValueError, OSError, KeyError, psycopg.Error) as error:
             parser.exit(1, f'Ошибка обслуживания: {error}\n')
     return 0

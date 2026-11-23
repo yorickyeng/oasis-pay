@@ -54,6 +54,7 @@ usage() {
   clients                       Показать регистрации кассы и покупателей
   clients-reset all|terminal|buyer
                                 Удалить регистрации, если с ними нет платежей
+  reset                         Очистить выбранный банк, включая платежи и регистрации
   ledger                        Показать счета и платежи
   stop-db                       Остановить общий PostgreSQL после остановки банка
   help                          Показать эту справку
@@ -122,6 +123,11 @@ PYTHON
             all|terminal|buyer) admin clients-reset --role "$2" ;;
             *) usage >&2; exit 2 ;;
         esac
+        ;;
+    reset)
+        [ "$#" -eq 1 ] || { usage >&2; exit 2; }
+        bank health
+        admin reset
         ;;
     stop-db)
         pg_ctl -D "$pg_dir" -m fast -w stop

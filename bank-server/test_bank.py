@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from psycopg.conninfo import make_conninfo
 from psycopg import sql
 
-from admin import apply, certificate_path, issue, reset_clients
+from admin import apply, certificate_path, issue, reset_clients, reset_sandbox
 from bank import BINDINGS, Bank, Server, initialize, migrate, now
 from protocol import P256_ORDER, ProtocolError, decode, digest, encode, message, public_bytes, public_key, sign, verify
 
@@ -86,6 +86,7 @@ class BankIntegration(unittest.TestCase):
             db.execute("TRUNCATE outbox, ledger, payments, devices")
             db.execute("DELETE FROM accounts WHERE id NOT IN ('demo-buyer','demo-merchant')")
             db.execute("UPDATE accounts SET balance=CASE WHEN id='demo-buyer' THEN 500000 ELSE 0 END")
+            db.execute("UPDATE sandbox_state SET reset_at=0")
         self.terminal = ec.generate_private_key(ec.SECP256R1())
         self.phone = ec.generate_private_key(ec.SECP256R1())
         terminal = self.enroll("terminal", self.terminal)
@@ -178,9 +179,9 @@ class BankIntegration(unittest.TestCase):
             db.execute("ALTER TABLE devices DROP CONSTRAINT devices_account_role_check")
             db.execute("ALTER TABLE devices DROP COLUMN account_id CASCADE")
             db.execute("ALTER TABLE devices DROP COLUMN registration_number CASCADE")
-            db.execute("DROP INDEX devices_single_terminal")
+            db.execute("ALTER TABLE devices DROP COLUMN token_nonce")
             db.execute("ALTER TABLE devices ADD CONSTRAINT devices_role_key UNIQUE(role)")
-            db.execute("DELETE FROM schema_migrations WHERE version=3")
+            db.execute("DELETE FROM schema_migrations WHERE version IN (3,4)")
         migrate(self.bank)
         with self.bank.connect() as db:
             buyer = db.execute("SELECT * FROM devices WHERE id=%s", (self.phone_id,)).fetchone()
@@ -190,6 +191,8 @@ class BankIntegration(unittest.TestCase):
             self.assertEqual(db.execute("SELECT result FROM payments").fetchone()["result"], original)
         renewed = self.enroll("buyer", self.phone)
         self.assertEqual(verify(renewed["certificate"], self.bank_key)["device_id"], self.phone_id)
+        self.assertEqual(renewed["access_token"], self.bank.token(self.phone_id, None))
+        self.enroll("terminal", ec.generate_private_key(ec.SECP256R1()))
 
     def test_multiple_buyers_have_independent_accounts_and_stable_bank_numbers(self):
         other = ec.generate_private_key(ec.SECP256R1())
@@ -242,6 +245,56 @@ class BankIntegration(unittest.TestCase):
         with self.bank.connect() as db:
             self.assertEqual(db.execute("SELECT count(*) AS n FROM ledger").fetchone()["n"], 1)
 
+    def test_two_terminals_and_buyers_pay_independent_orders_concurrently(self):
+        second_terminal = ec.generate_private_key(ec.SECP256R1())
+        second_buyer = ec.generate_private_key(ec.SECP256R1())
+        terminal_cert = verify(self.enroll("terminal", second_terminal)["certificate"], self.bank_key)
+        original_cert = verify(self.enroll("terminal", self.terminal)["certificate"], self.bank_key)
+        self.assertNotEqual(terminal_cert["registration_number"], original_cert["registration_number"])
+        buyer_enrolled = self.enroll("buyer", second_buyer)
+        buyer_id = verify(buyer_enrolled["certificate"], self.bank_key)["device_id"]
+
+        first = self.invoice()
+        # The sequence, order ID, nonce and transaction ID are scoped to a terminal.
+        second = first[0] | {"terminal_id": terminal_cert["device_id"]}
+        second_auth = sign(message("payment_authorization", environment="sandbox",
+            phone_device_id=buyer_id, terminal_request=sign(second, second_terminal),
+            **{name: second[name] for name in BINDINGS}), second_buyer)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            payments = [pool.submit(self.post, "payments", self.authorization(first), self.token),
+                        pool.submit(self.post, "payments", second_auth, buyer_enrolled["access_token"])]
+            for payment in payments:
+                self.assertEqual(verify(payment.result()["result"], self.bank_key)["status"], "PAID")
+        with self.bank.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) AS n FROM ledger").fetchone()["n"], 2)
+            accounts = dict((row["id"], row["balance"]) for row in db.execute("SELECT * FROM accounts"))
+            self.assertEqual(accounts, {"demo-buyer": 480100, f"buyer-{buyer_id}": 480100,
+                                        "demo-merchant": 39800})
+
+    def test_full_reset_restores_balances_and_requires_fresh_enrollment_and_orders(self):
+        invoice = self.invoice()
+        self.post("payments", self.authorization(invoice), self.token)
+        self.enroll("buyer", ec.generate_private_key(ec.SECP256R1()))
+        reset_sandbox(self.dsn)
+        with self.bank.connect() as db:
+            for table in ("devices", "payments", "ledger", "outbox"):
+                count = db.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(sql.Identifier(table)))
+                self.assertEqual(count.fetchone()["n"], 0)
+            self.assertEqual(db.execute("SELECT balance FROM accounts ORDER BY id").fetchall(),
+                             [{"balance": 500000}, {"balance": 0}])
+            cutoff = db.execute("SELECT reset_at FROM sandbox_state").fetchone()["reset_at"]
+        self.post("payments", self.authorization(invoice), self.token, 401)
+        self.enroll("terminal", self.terminal)
+        enrolled = self.enroll("buyer", self.phone)
+        new_token = enrolled["access_token"]
+        self.assertNotEqual(new_token, self.token)
+        self.post("payments", self.authorization(invoice), self.token, 401)
+        expired = self.post("payments", self.authorization(invoice), new_token, 400)
+        self.assertEqual(expired["error"], "request_expired")
+        new_invoice = self.invoice(created_at=cutoff + 1, expires_at=cutoff + 121)
+        result = self.post("payments", self.authorization(new_invoice), new_token)
+        self.assertEqual(verify(result["result"], self.bank_key)["status"], "PAID")
+
     def test_reset_clients_preserves_balances_and_allows_new_device(self):
         reset_clients(self.dsn, "terminal")
         with self.bank.connect() as db:
@@ -290,7 +343,7 @@ class BankIntegration(unittest.TestCase):
     def test_rejects_forgery_expiry_and_replay(self):
         invoice = self.invoice()
         unknown_key = ec.generate_private_key(ec.SECP256R1())
-        self.assertEqual(self.enroll("terminal", unknown_key, 400)["error"], "enrollment_unavailable")
+        self.assertEqual(self.enroll("terminal", self.phone, 400)["error"], "enrollment_unavailable")
         self.post("payments", self.authorization(invoice), "a" * 64, 401)
         self.post("payments", self.authorization(invoice, key=unknown_key), self.token, 400)
         self.post("payments", self.authorization(invoice, amount=1), self.token, 400)
