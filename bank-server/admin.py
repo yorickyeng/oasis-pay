@@ -174,8 +174,8 @@ def reset_clients(dsn, role):
         referenced = db.execute('SELECT EXISTS (SELECT 1 FROM payments WHERE '
                                 'terminal_id = ANY(%s) OR buyer_id = ANY(%s))', (ids, ids)).fetchone()[0]
         if referenced:
-            raise ValueError('Сброс отменён: устройства связаны с платежами. Историю удалять нельзя; '
-                             'используйте отдельный учебный проект Docker для новых устройств.')
+            raise ValueError('Сброс отменён: устройства связаны с платежами. '
+                             'Для новой регистрации запустите отдельный тестовый банк.')
         db.execute('DELETE FROM devices WHERE id = ANY(%s)', (ids,))
         print('Удалено регистраций:', len(ids))
 

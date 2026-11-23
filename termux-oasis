@@ -7,9 +7,23 @@ state_dir="$HOME/.local/share/oasis-pay"
 pg_dir="$state_dir/postgres"
 socket_dir="$state_dir/socket"
 keys_dir="$state_dir/keys"
+database=oasis
+if [ "${1:-}" = --profile ]; then
+    profile="${2:-}"
+    case "$profile" in
+        ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+            echo 'Укажите имя профиля из строчных латинских букв, цифр или подчёркиваний.' >&2
+            exit 2
+            ;;
+    esac
+    [ "${#profile}" -le 24 ] || { echo 'Имя профиля: не более 24 символов.' >&2; exit 2; }
+    database="oasis_$profile"
+    keys_dir="$state_dir/profiles/$profile/keys"
+    shift 2
+fi
 python="$state_dir/venv/bin/python"
 export PGHOST="$socket_dir" PGPORT=55432 PGUSER=oasis
-export OASIS_DATABASE_URL="dbname=oasis user=oasis port=55432 host='$socket_dir'"
+export OASIS_DATABASE_URL="dbname=$database user=oasis port=55432 host='$socket_dir'"
 export PSYCOPG_IMPL=python
 
 bank() { "$python" bank-server/bank.py --state "$keys_dir" "$@"; }
@@ -24,14 +38,15 @@ start_postgres() {
         pg_ctl -D "$pg_dir" -l "$state_dir/postgres.log" \
             -o "-c listen_addresses='' -k '$socket_dir' -p $PGPORT" -w start
     fi
-    if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'oasis'" | grep -qx 1; then
-        createdb oasis
+    if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$database'" | grep -qx 1; then
+        createdb "$database"
     fi
 }
 
 usage() {
     cat <<'HELP'
-Использование: sh termux-oasis <команда>
+Использование: sh termux-oasis [--profile ИМЯ] <команда>
+  --profile ИМЯ                 Использовать отдельную базу и ключи
   setup                         Установить зависимости
   start [IPv4]                  Запустить банк в текущем сеансе
   show                          Показать URL, отпечаток TLS и коды ролей
@@ -40,7 +55,7 @@ usage() {
   clients-reset all|terminal|buyer
                                 Удалить регистрации, если с ними нет платежей
   ledger                        Показать счета и платежи
-  stop-db                       Остановить PostgreSQL после остановки банка
+  stop-db                       Остановить общий PostgreSQL после остановки банка
   help                          Показать эту справку
 HELP
 }
@@ -58,9 +73,26 @@ case "${1:-help}" in
     start)
         [ "$#" -le 2 ] || exit 2
         [ -x "$python" ] || { echo 'Сначала выполните: sh termux-oasis setup' >&2; exit 1; }
-        if bank health >/dev/null 2>&1; then echo 'Банк уже запущен.' >&2; exit 1; fi
+        if ! "$python" - <<'PYTHON'
+import errno
+import socket
+import sys
+
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(("0.0.0.0", 8443))
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            sys.exit("Порт 8443 занят. Остановите работающий банк в первом сеансе Termux через Ctrl+C.")
+        raise
+PYTHON
+        then
+            exit 1
+        fi
         start_postgres
         if [ ! -d "$keys_dir" ]; then
+            mkdir -p "$(dirname "$keys_dir")"
             bank init --host "${2:-127.0.0.1}" >/dev/null
         elif [ "$#" -eq 2 ]; then
             if admin network-ready --host "$2"; then :; else
